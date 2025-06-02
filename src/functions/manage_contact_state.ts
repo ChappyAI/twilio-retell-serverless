@@ -65,14 +65,22 @@ async function addOrUpdateContact(
   context: MyContext,
   state: ContactCadenceState
 ): Promise<{ success: boolean; message?: string }> {
-  console.log('addOrUpdateContact called with state:', state);
+  console.log(`addOrUpdateContact called for phoneNumber: ${state.phoneNumber}`);
+  // Log new prioritization fields if present
+  if (state.state || state.zipcode || state.hopperPriority !== undefined) {
+    console.log(`Prioritization fields present - State: ${state.state}, Zipcode: ${state.zipcode}, HopperPriority: ${state.hopperPriority}`);
+  }
+  // Full state object for debugging if needed, but can be verbose
+  // console.debug('Full state object being processed:', JSON.stringify(state, null, 2));
+
+
   const syncClient = getSyncClient(context);
   const listName = context.ACTIVE_CADENCE_CONTACTS_LIST_NAME || ACTIVE_CADENCE_CONTACTS_LIST_UNIQUE_NAME;
 
   try {
     // Update or create the Sync Document for the contact
     // The `update` method creates the document if it doesn't exist when a uniqueName is provided.
-    await syncClient.documents(state.phoneNumber).update({ 
+    await syncClient.documents(state.phoneNumber).update({
       data: state,
       ttl: SYNC_DOCUMENT_DEFAULT_TTL // Or a specific TTL based on state, e.g. if COMPLETED
     });
@@ -110,11 +118,11 @@ async function addOrUpdateContact(
           // A common workaround: try to create a document named `listName + '/' + state.phoneNumber`
           // If that succeeds, add to list. If it fails (already exists), then it's already "marked".
           // This is too complex for now. We will just add to the list.
-          
+
           // Let's try a fetch specific item by value (not standard, but some SDKs might offer helpers or it's a map pattern)
           // Sync List items are identified by their index. To remove a specific item by value,
           // you would typically iterate through the list, find the item, and then remove it by its index.
-          
+
           // Given the constraints, we'll add and suggest query-side deduplication or a more robust list management strategy if needed.
           await syncClient.lists(listName).syncListItems.create({ data: { phoneNumber: state.phoneNumber } });
           console.log(`Added ${state.phoneNumber} to ${listName} list.`);
@@ -194,60 +202,85 @@ async function queryContactsDueForCall(
   console.log('queryContactsDueForCall called with timestamp:', timestamp);
   const syncClient = getSyncClient(context);
   const listName = context.ACTIVE_CADENCE_CONTACTS_LIST_NAME || ACTIVE_CADENCE_CONTACTS_LIST_UNIQUE_NAME;
-  const dueContacts: ContactCadenceState[] = [];
-  const processedPhoneNumbers = new Set<string>(); // To handle potential duplicates in the list
+
+  let allActiveContacts: ContactCadenceState[] = [];
+  const processedPhoneNumbers = new Set<string>(); // To handle potential duplicates in the list if any
 
   try {
-    // Fetch all items from the active_cadence_contacts Sync List
-    // Sync lists are paginated. We need to handle pagination to get all items.
-    let page = await syncClient.lists(listName).syncListItems.list({ pageSize: 100 });
-    
+    console.log(`Fetching all items from Sync List: ${listName}`);
+    let page = await syncClient.lists(listName).syncListItems.list({ pageSize: 100 }); // Max pageSize is 100 for Sync Lists
+
     while (true) {
       for (const item of page) {
         const contactPhoneNumber = item.data.phoneNumber as string;
-        if (!contactPhoneNumber || processedPhoneNumbers.has(contactPhoneNumber)) {
-          // Skip if phoneNumber is missing in item data or already processed
-          continue; 
+
+        if (!contactPhoneNumber) {
+          console.warn('Skipping item with no phoneNumber in data:', item);
+          continue;
+        }
+        if (processedPhoneNumbers.has(contactPhoneNumber)) {
+          console.warn(`Skipping duplicate phoneNumber ${contactPhoneNumber} from list ${listName}.`);
+          continue;
         }
         processedPhoneNumbers.add(contactPhoneNumber);
 
-        console.log(`Querying details for contact: ${contactPhoneNumber} from list ${listName}`);
         try {
           const contactState = await getContactState(context, contactPhoneNumber);
-
-          if (contactState) {
-            if (['ACTIVE', 'PENDING'].includes(contactState.status) && contactState.nextCallTimestamp) {
-              const nextCallDate = new Date(contactState.nextCallTimestamp);
-              const queryDate = new Date(timestamp);
-              if (nextCallDate <= queryDate) {
-                dueContacts.push(contactState);
-              }
-            }
-          } else {
-            // Inconsistency: contact in active list but no Sync Document found.
-            // This might warrant removing it from the list.
-            console.warn(`Contact ${contactPhoneNumber} found in ${listName} but no matching Sync Document. Consider removing from list.`);
-            // Optionally, try to remove it here:
-            // await syncClient.lists(listName).syncListItems(item.index.toString()).remove();
+          if (contactState && ['ACTIVE', 'PENDING'].includes(contactState.status)) {
+            allActiveContacts.push(contactState);
+          } else if (!contactState) {
+             console.warn(`Contact ${contactPhoneNumber} found in ${listName} but no matching Sync Document. Consider removing from list.`);
+             // Optionally, try to remove it here if it implies an orphaned list item:
+             // await syncClient.lists(listName).syncListItems(item.index.toString()).remove();
           }
         } catch (error) {
             // @ts-ignore
-            console.error(`Error fetching state for ${contactPhoneNumber} during query: ${error.message}`);
-            // Continue processing other contacts
+            console.error(`Error fetching state for ${contactPhoneNumber} during query: ${error.message}. Skipping this contact.`);
         }
       }
       // @ts-ignore
-      if (page.hasNextPage) {
+      if (page.hasNextPage && page.meta.key) { // Check hasNextPage and that meta.key is present for pagination
         // @ts-ignore
         page = await page.nextPage();
       } else {
         break;
       }
     }
-    console.log(`Found ${dueContacts.length} contacts due for a call.`);
+    console.log(`Fetched ${allActiveContacts.length} active/pending contacts from list ${listName}.`);
+
+    // Sort contacts: Primary by hopperPriority (ascending, undefined is lowest), Secondary by nextCallTimestamp (ascending)
+    allActiveContacts.sort((a, b) => {
+      const priorityA = a.hopperPriority ?? Number.MAX_SAFE_INTEGER;
+      const priorityB = b.hopperPriority ?? Number.MAX_SAFE_INTEGER;
+
+      if (priorityA !== priorityB) {
+        return priorityA - priorityB;
+      }
+
+      // Ensure nextCallTimestamp exists for sorting, treat missing as very far in the future (or past, depending on desired behavior for nulls)
+      // Here, treating null/undefined nextCallTimestamp as "not due" or "last priority" among those with same hopperPriority.
+      // For actual due filtering, we check against `timestamp` later.
+      const timeA = a.nextCallTimestamp ? new Date(a.nextCallTimestamp).getTime() : Number.MAX_SAFE_INTEGER;
+      const timeB = b.nextCallTimestamp ? new Date(b.nextCallTimestamp).getTime() : Number.MAX_SAFE_INTEGER;
+
+      return timeA - timeB;
+    });
+
+    console.log(`Sorted ${allActiveContacts.length} active contacts. First few after sorting:`, allActiveContacts.slice(0,5).map(c => ({p:c.phoneNumber, prio: c.hopperPriority, next: c.nextCallTimestamp})));
+
+    // Filter by due time
+    const queryDate = new Date(timestamp);
+    const dueContacts = allActiveContacts.filter(contactState => {
+      if (!contactState.nextCallTimestamp) return false;
+      const nextCallDate = new Date(contactState.nextCallTimestamp);
+      return nextCallDate <= queryDate;
+    });
+
+    console.log(`Found ${dueContacts.length} contacts due for a call after filtering by timestamp ${timestamp}.`);
     return dueContacts;
+
   } catch (error) {
-    // @ts-ignore
+     // @ts-ignore
     if (error.status === 404) {
         console.warn(`Sync List ${listName} not found. Returning empty array.`);
         return []; // If the list itself doesn't exist, no contacts are due from it.

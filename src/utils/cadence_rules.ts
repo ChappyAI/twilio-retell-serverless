@@ -1,97 +1,135 @@
-// Cadence Rules Types
-export interface CadenceAttemptRule {
-  delayMinutes: number; // Delay for this specific attempt after the previous one's outcome
+// Cadence Rules New Type Definitions
+
+export interface CadenceRuleDelay {
+  days: number;
+  hours: number;
+  minutes: number;
+  seconds: number;
+}
+
+export interface CadenceRuleSegment {
+  callCountMin: number;      // Inclusive minimum overall attemptCount for this segment to apply
+  callCountMax: number;      // Inclusive maximum overall attemptCount for this segment to apply
+                             // When processing outcome of attempt N, contact.attemptCount is N.
+                             // This segment applies if N is within callCountMin/Max.
+  delay: CadenceRuleDelay;   // The delay to apply *after* a call in this segment, for scheduling the *next* call.
+  hopperPriorityOverride?: number;
 }
 
 export interface CadenceDispositionRule {
-  maxAttempts: number; // Total attempts allowed *under this specific disposition track*
-                       // This means if disposition changes, maxAttempts for new disposition applies.
-  attempts: CadenceAttemptRule[]; // Ordered list of attempt delays.
-                                  // Length should ideally match maxAttempts.
-                                  // Index `i` is for the (i+1)-th attempt in this disposition sequence.
-  finalStatusOnExhaustion: 'COMPLETED_EXHAUSTED' | 'PAUSED' | 'ERROR'; // Status if max attempts for this disposition reached
-  // Optional: Flag to indicate if this disposition should reset the attempt count for the overall lead,
-  // or if a specific disposition sequence should use its own counter.
-  // For now, we assume the main contactState.attemptCount is the primary counter.
+  segments: CadenceRuleSegment[];
+  defaultHopperPriority?: number;
+  finalStatusOnExhaustion: 'COMPLETED_EXHAUSTED' | 'PAUSED' | 'COMPLETED_SUCCESS' | 'ERROR'; // Ensure all relevant final states are here
 }
 
 export interface CadenceRulesConfig {
   [disposition: string]: CadenceDispositionRule;
-  NEW_LEAD: CadenceDispositionRule; // Rule for contacts with no prior attempts (contact.attemptCount === 0)
-  DEFAULT: CadenceDispositionRule;  // Fallback for unlisted dispositions
-  // Specific terminal dispositions that should always complete the cadence
-  APPOINTMENT_SCHEDULED_AI?: CadenceDispositionRule; // Example
-  HUMAN_HANDOFF_SUCCESSFUL?: CadenceDispositionRule; // Example
-  // Note: These specific terminal dispositions might not need full CadenceDispositionRule structure if they simply terminate.
-  // However, using the structure allows for consistency. MaxAttempts could be 1.
+  DEFAULT: CadenceDispositionRule;
+  NEW_LEAD: CadenceDispositionRule; // Rule for a contact before any call attempts (contact.attemptCount === 0)
+  // Specific terminal dispositions can be defined here too
+  APPOINTMENT_SCHEDULED_AI?: CadenceDispositionRule;
+  CALL_COMPLETED_HUMAN_HANDOFF?: CadenceDispositionRule;
 }
 
-// Hardcoded Cadence Rules Configuration
+// Helper to convert simple minutes to CadenceRuleDelay
+function minutesDelay(minutes: number): CadenceRuleDelay {
+  return { days: 0, hours: 0, minutes, seconds: 0 };
+}
+
+// Updated Cadence Rules Configuration
 export function getCadenceRules(): CadenceRulesConfig {
   return {
-    NEW_LEAD: { // For brand new leads (overall contact.attemptCount will be 0)
-      maxAttempts: 5, // Total attempts for a new lead if it keeps getting non-terminal dispositions
-      attempts: [
-        // Delay for the 1st attempt is implicitly handled by how soon the engine picks it up.
-        // The delays here are for *subsequent* attempts *if the disposition remains unchanged or maps to a retryable one*.
-        // This rule might be better named e.g. "STANDARD_RETRY_SEQUENCE" if NEW_LEAD is just for the first call.
-        // Let's assume NEW_LEAD implies the sequence for a lead that hasn't had a significant outcome yet.
-        { delayMinutes: 0 },       // For 1st attempt (engine picks up, this '0' is conceptual for calculating next step after outcome)
-        { delayMinutes: 60 },      // For 2nd attempt (1 hour after outcome of attempt 1)
-        { delayMinutes: 24 * 60 }, // For 3rd attempt (1 day after outcome of attempt 2)
-        { delayMinutes: 48 * 60 }, // For 4th attempt (2 days after outcome of attempt 3)
-        { delayMinutes: 72 * 60 }, // For 5th attempt (3 days after outcome of attempt 4)
+    NEW_LEAD: { // Rule for a new lead (contact.attemptCount === 0 when engine evaluates it)
+      segments: [
+        // This segment applies when the engine is about to make the 1st call.
+        // The delay here is for *after* the 1st call, if its disposition maps back to NEW_LEAD (unlikely)
+        // or if this rule is used as a generic "initial attempts" sequence.
+        // More practically, NEW_LEAD in engine means "call now". Webhook uses outcome disposition.
+        // For webhook: if outcome is e.g. NO_ANSWER, and attemptCount becomes 1, it uses NO_ANSWER rule, segment matching attemptCount 1.
+        { callCountMin: 0, callCountMax: 0, delay: { days: 0, hours: 0, minutes: 0, seconds: 0 } }
+      ],
+      defaultHopperPriority: 100,
+      finalStatusOnExhaustion: 'COMPLETED_EXHAUSTED', // Should not be reached if segments are for attempt 0 only
+    },
+    ANSWERING_MACHINE: { // Based on user's "A - Answering Machine"
+      defaultHopperPriority: 50, // Example default for this disposition
+      segments: [
+        // User: A - Answering Machine,0,1,0,0,22,4,None -> after 1st call (attemptCount becomes 1)
+        { callCountMin: 1, callCountMax: 1, delay: { days: 0, hours: 0, minutes: 22, seconds: 4 } },
+        // User: A - Answering Machine,2,2,0,0,11,52,None -> after 2nd call
+        { callCountMin: 2, callCountMax: 2, delay: { days: 0, hours: 0, minutes: 11, seconds: 52 } },
+        // User: A - Answering Machine,3,3,0,0,22,4,None -> after 3rd call
+        { callCountMin: 3, callCountMax: 3, delay: { days: 0, hours: 0, minutes: 22, seconds: 4 } },
+        // User: A - Answering Machine,4,4,0,0,11,52,None -> after 4th call
+        { callCountMin: 4, callCountMax: 4, delay: { days: 0, hours: 0, minutes: 11, seconds: 52 } },
+        // User: A - Answering Machine,5,5,0,1,30,32,None -> after 5th call
+        { callCountMin: 5, callCountMax: 5, delay: { days: 0, hours: 1, minutes: 30, seconds: 32 } },
+        // User: A - Answering Machine,6,6,0,0,22,4,None -> after 6th call
+        { callCountMin: 6, callCountMax: 6, delay: { days: 0, hours: 0, minutes: 22, seconds: 4 } },
+        // User: A - Answering Machine,7,7,0,1,30,32,None -> after 7th call
+        { callCountMin: 7, callCountMax: 7, delay: { days: 0, hours: 1, minutes: 30, seconds: 32 } },
+        // User: A - Answering Machine,8,8,0,0,11,52,None -> after 8th call
+        { callCountMin: 8, callCountMax: 8, delay: { days: 0, hours: 0, minutes: 11, seconds: 52 } },
+        // User: A - Answering Machine,9,9,0,1,30,32,None -> after 9th call
+        { callCountMin: 9, callCountMax: 9, delay: { days: 0, hours: 1, minutes: 30, seconds: 32 } },
+        // User: A - Answering Machine,10,10,0,0,22,4,None -> after 10th call
+        { callCountMin: 10, callCountMax: 10, delay: { days: 0, hours: 0, minutes: 22, seconds: 4 } },
+        // After 10 attempts with ANSWERING_MACHINE, this rule will lead to finalStatusOnExhaustion
+        // if attemptCount becomes 11 and still ANSWERING_MACHINE.
+      ],
+      finalStatusOnExhaustion: 'PAUSED', // Example: pause after exhausting answering machine attempts
+    },
+    NO_ANSWER: {
+      segments: [
+        { callCountMin: 1, callCountMax: 1, delay: minutesDelay(20) },  // After 1st NO_ANSWER
+        { callCountMin: 2, callCountMax: 2, delay: minutesDelay(120) }, // After 2nd NO_ANSWER
+        { callCountMin: 3, callCountMax: 3, delay: { days: 1, hours: 0, minutes: 0, seconds: 0 } } // After 3rd
       ],
       finalStatusOnExhaustion: 'COMPLETED_EXHAUSTED',
     },
-    NO_ANSWER: { // If lastCallDisposition was NO_ANSWER
-      maxAttempts: 3, // Max 3 consecutive NO_ANSWER before changing strategy or exhausting
-      attempts: [
-        { delayMinutes: 20 },  // After 1st NO_ANSWER, try again in 20 mins
-        { delayMinutes: 120 }, // After 2nd NO_ANSWER, try again in 2 hours
-        { delayMinutes: 24 * 60 },// After 3rd NO_ANSWER, try again in 1 day (if maxAttempts allows for a 4th)
+    VOICEMAIL_DETECTED: { // This might be same as ANSWERING_MACHINE or different
+      segments: [
+        { callCountMin: 1, callCountMax: 1, delay: { days: 2, hours: 0, minutes: 0, seconds: 0 } },
+        { callCountMin: 2, callCountMax: 2, delay: { days: 5, hours: 0, minutes: 0, seconds: 0 } },
       ],
-      finalStatusOnExhaustion: 'COMPLETED_EXHAUSTED',
-    },
-    VOICEMAIL_DETECTED: {
-      maxAttempts: 2,
-      attempts: [
-        { delayMinutes: 2 * 24 * 60 }, // Try again in 2 days
-        { delayMinutes: 5 * 24 * 60 }, // Then try again in 5 days
-      ],
-      finalStatusOnExhaustion: 'PAUSED', // Pause for manual review if voicemail hit twice
+      defaultHopperPriority: 40,
+      finalStatusOnExhaustion: 'PAUSED',
     },
     BUSY: {
-      maxAttempts: 2,
-      attempts: [
-        { delayMinutes: 15 },
-        { delayMinutes: 60 },
+      segments: [
+        { callCountMin: 1, callCountMax: 1, delay: minutesDelay(15) },
+        { callCountMin: 2, callCountMax: 2, delay: minutesDelay(60) },
       ],
       finalStatusOnExhaustion: 'COMPLETED_EXHAUSTED',
     },
-    ERROR_CALL_FAILED: { // For technical errors during the call itself
-      maxAttempts: 2,
-      attempts: [
-        { delayMinutes: 5 },  // Quick retry
-        { delayMinutes: 30 }, // Longer retry
+    ERROR_CALL_FAILED: { // For technical errors reported by Retell/Twilio during the call
+      segments: [
+        { callCountMin: 1, callCountMax: 2, delay: minutesDelay(5) }, // Quick retry for first 2 failures
+        { callCountMin: 3, callCountMax: 3, delay: minutesDelay(30) },// Longer retry for 3rd
       ],
       finalStatusOnExhaustion: 'ERROR',
     },
-    // Example of a specific terminal disposition
-    APPOINTMENT_SCHEDULED_AI: {
-        maxAttempts: 1, // This disposition means completion
-        attempts: [{ delayMinutes: 0 }], // No further attempts
+    ERROR_INITIATION_FAILED: { // Custom disposition if cadence engine fails to even start a call
+        segments: [
+            { callCountMin: 1, callCountMax: 3, delay: minutesDelay(10) }, // Retry initiation few times
+        ],
+        finalStatusOnExhaustion: 'ERROR',
+    },
+    APPOINTMENT_SCHEDULED_AI: { // Terminal success
+        segments: [
+            // No delay needed as it's terminal. Segment defines what happens if this state is re-evaluated (it shouldn't be).
+            { callCountMin: 1, callCountMax: 99, delay: minutesDelay(0) }
+        ],
         finalStatusOnExhaustion: 'COMPLETED_SUCCESS',
     },
-    CALL_COMPLETED_HUMAN_HANDOFF: { // Assuming this is a disposition from Retell
-        maxAttempts: 1,
-        attempts: [{ delayMinutes: 0 }],
-        finalStatusOnExhaustion: 'PAUSED', // Or COMPLETED_SUCCESS depending on definition
+    CALL_COMPLETED_HUMAN_HANDOFF: { // Terminal, pending further action outside automated cadence
+        segments: [ { callCountMin: 1, callCountMax: 99, delay: minutesDelay(0) } ],
+        finalStatusOnExhaustion: 'PAUSED',
     },
-    DEFAULT: { // Fallback for any other disposition not explicitly listed
-      maxAttempts: 1, 
-      attempts: [
-        { delayMinutes: 5 }, // Default quick retry once for an unknown disposition
+    DEFAULT: { // Fallback for any other disposition
+      segments: [
+        // Applies if attemptCount is 1 (after 1st call with unknown disposition)
+        { callCountMin: 1, callCountMax: 1, delay: minutesDelay(5) },
       ],
       finalStatusOnExhaustion: 'COMPLETED_EXHAUSTED', // Or 'PAUSED' for review
     },

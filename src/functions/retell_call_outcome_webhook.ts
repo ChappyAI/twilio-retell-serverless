@@ -2,15 +2,20 @@ import { Context as ServerlessContext, ServerlessCallback, TwilioClient } from '
 import { ContactCadenceState } from '../types/cadence_state';
 import { getCadenceRules, CadenceRulesConfig, CadenceDispositionRule } from '../utils/cadence_rules'; // Import shared rules
 
+import { Context as ServerlessContext, ServerlessCallback, TwilioClient } from '@twilio-labs/serverless-runtime-types/types';
+import { ContactCadenceState } from '../types/cadence_state';
+// Ensure all necessary types from the shared rules are imported
+import { getCadenceRules, CadenceRulesConfig, CadenceDispositionRule, CadenceRuleSegment, CadenceRuleDelay } from '../utils/cadence_rules';
+
 // Define MyContext to include environment variables
 interface MyContext extends ServerlessContext {
   TWILIO_SYNC_SERVICE_SID: string;
   SEGMENT_WRITE_KEY?: string;
-  ACCOUNT_SID: string; // Needed for create_task if not using client from context directly for specific calls
-  AUTH_TOKEN: string;  // Needed for create_task if not using client from context directly for specific calls
+  ACCOUNT_SID: string;
+  AUTH_TOKEN: string;
   TWILIO_WORKSPACE_SID?: string;
   TWILIO_WORKFLOW_SID?: string;
-  RETELL_HANDOFF_DISPOSITIONS?: string; // Comma-separated list, e.g., "CALL_COMPLETED_HUMAN_HANDOFF,CALL_TRANSFERRED"
+  RETELL_HANDOFF_DISPOSITIONS?: string;
   MANAGE_CONTACT_STATE_FUNCTION_SID?: string;
   ADD_EVENT_FUNCTION_SID?: string;
   CREATE_TASK_FUNCTION_SID?: string;
@@ -122,53 +127,66 @@ export const handler = async (
     const dispositionKey = contactState.lastCallDisposition || 'DEFAULT';
     // Use 'NEW_LEAD' rule if it's the very first attempt outcome for a lead not previously in system,
     // otherwise use specific disposition or DEFAULT.
-    // The `contactState.attemptCount` is now 1 for the first successfully processed call.
-    const effectiveRuleKey = (contactState.attemptCount === 1 && !fetchedContactState) ? 'NEW_LEAD' : dispositionKey;
-    const rule = cadenceRules[effectiveRuleKey] || cadenceRules.DEFAULT;
+    // The `contactState.attemptCount` has been incremented to reflect the call that just finished.
+    const rules = getCadenceRules();
+    const dispositionKey = contactState.lastCallDisposition || 'DEFAULT'; // Use DEFAULT if no disposition
 
-    console.log(`Applying rule: ${effectiveRuleKey} for disposition: ${contactState.lastCallDisposition}. Attempt count now: ${contactState.attemptCount}`);
+    // Special handling for NEW_LEAD rule if this is the first attempt for a newly created contact state
+    // This ensures that the NEW_LEAD rule's segments (which expect attemptCount 0 or 1) are correctly applied.
+    // However, the CadenceEngine handles attempt 0. Webhook gets outcome of attempt 1.
+    // So, effectiveRuleKey will usually be based on actual lastCallDisposition.
+    const currentRule = rules[dispositionKey] || rules.DEFAULT; // Fallback to DEFAULT rule
 
-    // Check for specific terminal dispositions that override attempt-based logic
+    console.log(`Applying rule for disposition: "${dispositionKey}", Effective Rule Key: "${dispositionKey}". Attempt count: ${contactState.attemptCount}.`);
+
+    // Default to current priority or disposition default
+    contactState.hopperPriority = contactState.hopperPriority ?? currentRule.defaultHopperPriority;
+
+    // Handle explicit terminal dispositions first
     const handoffDispositions = (context.RETELL_HANDOFF_DISPOSITIONS || "CALL_COMPLETED_HUMAN_HANDOFF,CALL_TRANSFERRED").split(',');
-    
-    if (rule.finalStatusOnExhaustion === 'COMPLETED_SUCCESS' && rule.maxAttempts === 1) { // E.g. APPOINTMENT_SCHEDULED_AI
+
+    if (dispositionKey === 'APPOINTMENT_SCHEDULED_AI' || currentRule.finalStatusOnExhaustion === 'COMPLETED_SUCCESS') { // Check rule's intent
         contactState.status = 'COMPLETED_SUCCESS';
         contactState.nextCallTimestamp = undefined;
-        console.log(`Terminal success disposition ${dispositionKey}. Status: COMPLETED_SUCCESS.`);
-    } else if (handoffDispositions.includes(event.disposition)) {
-        contactState.status = 'PAUSED'; // Or rule.finalStatusOnExhaustion if defined for handoff dispositions
+        contactState.hopperPriority = undefined; // Or a low priority for completed leads
+        console.log(`Terminal success disposition or rule for ${dispositionKey}. Status: COMPLETED_SUCCESS.`);
+    } else if (handoffDispositions.includes(dispositionKey)) {
+        contactState.status = 'PAUSED';
         contactState.nextCallTimestamp = undefined;
-        console.log(`Handoff disposition ${event.disposition}. Status: PAUSED.`);
-    } else if (contactState.attemptCount >= rule.maxAttempts) {
-        contactState.status = rule.finalStatusOnExhaustion;
-        contactState.nextCallTimestamp = undefined;
-        console.log(`Max attempts (${rule.maxAttempts}) reached for rule ${effectiveRuleKey}. Status: ${contactState.status}.`);
+        // Potentially set a specific hopperPriority for PAUSED handoff items if needed
+        console.log(`Handoff disposition ${dispositionKey}. Status: PAUSED.`);
     } else {
-        contactState.status = 'ACTIVE'; // Ready for next attempt
-        // `contactState.attemptCount` is number of attempts *completed*.
-        // So, `rule.attempts[contactState.attemptCount]` is the delay for the *next* attempt.
-        const nextAttemptDelayConfigIndex = contactState.attemptCount; // If 1 attempt done, use index 1 for 2nd attempt's delay.
-                                                                      // This seems off, rule.attempts[0] is for 1st retry (2nd call)
-                                                                      // If contactState.attemptCount is 1 (1st call done), next call is 2nd attempt, so delay is rule.attempts[0] for that.
-                                                                      // No, rule.attempts[0] is delay for 1st attempt in sequence, rule.attempts[1] for 2nd.
-                                                                      // The rule applies to the *sequence following this disposition*.
-                                                                      // So, if current disposition is NO_ANSWER, and attemptCount for NO_ANSWER sequence is 1,
-                                                                      // then use rule.attempts[0].delayMinutes.
-                                                                      // THIS REQUIRES attempt count *per disposition sequence*, not global.
-                                                                      // SIMPLIFICATION: Using global attemptCount to pick from the array.
-                                                                      // This means rule.attempts should be long enough for max global attempts.
-                                                                      // Let's use contactState.attemptCount -1 as index for current attempt's outcome processing
-                                                                      // and contactState.attemptCount for NEXT attempt's schedule.
+        // Find matching segment based on current (incremented) attemptCount
+        const matchedSegment = currentRule.segments.find(segment =>
+            contactState.attemptCount >= segment.callCountMin && contactState.attemptCount <= segment.callCountMax
+        );
 
-        if (nextAttemptDelayConfigIndex < rule.attempts.length) {
-            const delayMinutes = rule.attempts[nextAttemptDelayConfigIndex].delayMinutes;
-            contactState.nextCallTimestamp = new Date(Date.now() + delayMinutes * 60000).toISOString();
-            console.log(`Next call scheduled for ${contactState.phoneNumber} at ${contactState.nextCallTimestamp} (delay: ${delayMinutes} mins).`);
+        if (matchedSegment) {
+            console.log(`Matched segment for attempt count ${contactState.attemptCount}:`, matchedSegment);
+            contactState.status = 'ACTIVE'; // Mark as active for the next attempt
+
+            const delay = matchedSegment.delay;
+            let nextCallDate = new Date(); // Calculate from now
+            nextCallDate.setDate(nextCallDate.getDate() + delay.days);
+            nextCallDate.setHours(nextCallDate.getHours() + delay.hours);
+            nextCallDate.setMinutes(nextCallDate.getMinutes() + delay.minutes);
+            nextCallDate.setSeconds(nextCallDate.getSeconds() + delay.seconds);
+            contactState.nextCallTimestamp = nextCallDate.toISOString();
+
+            // Apply priority override from segment, or fallback to disposition default, or keep existing.
+            if (matchedSegment.hopperPriorityOverride !== undefined) {
+                contactState.hopperPriority = matchedSegment.hopperPriorityOverride;
+            }
+            // If no override, hopperPriority remains as it was (either from before, or set by disposition default above)
+
+            console.log(`Next call for ${contactState.phoneNumber} scheduled at ${contactState.nextCallTimestamp}. Hopper Priority: ${contactState.hopperPriority}`);
         } else {
-            // Fallback if attempts array is shorter than maxAttempts (rules misconfiguration)
-            contactState.status = rule.finalStatusOnExhaustion;
-            contactState.nextCallTimestamp = undefined;
-            console.warn(`Attempt array for rule ${effectiveRuleKey} is too short for attempt number ${contactState.attemptCount + 1}. Setting to final status: ${contactState.status}.`);
+            // No matching segment found - means attempts for this disposition are exhausted according to defined segments
+            console.log(`No matching segment for disposition "${dispositionKey}" and attempt count ${contactState.attemptCount}. Applying final status.`);
+            contactState.status = currentRule.finalStatusOnExhaustion;
+            contactState.nextCallTimestamp = undefined; // No next call
+            // Hopper priority might be cleared or set to a low value for exhausted leads
+            contactState.hopperPriority = undefined; // Or specific low priority
         }
     }
 
@@ -203,7 +221,7 @@ export const handler = async (
         console.log('Logging event to Segment:', eventProperties);
         // @ts-ignore
         await twilioClient.serverless.services(serverlessServiceSid).functions(addEventFunction).invocations.create({
-          userId: event.phone_number, 
+          userId: event.phone_number,
           eventName: 'Retell Call Outcome Processed',
           properties: eventProperties,
         });
@@ -216,7 +234,7 @@ export const handler = async (
     // Step 6: Trigger TaskRouter for Human Handoff
     const createTaskFunction = context.CREATE_TASK_FUNCTION_SID || 'create_task';
     // Check against updated contactState.status as rules might have set it to PAUSED for handoff
-    if (context.TWILIO_WORKSPACE_SID && context.TWILIO_WORKFLOW_SID && createTaskFunction && 
+    if (context.TWILIO_WORKSPACE_SID && context.TWILIO_WORKFLOW_SID && createTaskFunction &&
         (handoffDispositions.includes(event.disposition) || contactState.status === 'PAUSED' && handoffDispositions.includes(contactState.lastCallDisposition || ''))) {
       const taskAttributes = {
         twilio_call_sid: event.twilio_call_sid,

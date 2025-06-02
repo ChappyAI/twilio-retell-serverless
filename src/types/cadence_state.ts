@@ -9,4 +9,8 @@ export interface ContactCadenceState {
   status: 'PENDING' | 'ACTIVE' | 'PAUSED' | 'COMPLETED_SUCCESS' | 'COMPLETED_EXHAUSTED' | 'ERROR';
   metadata?: { [key: string]: any };
   currentCallSid?: string; // SID of the call currently being attempted for this contact
+  // New fields for prioritization
+  state?: string;       // For US state
+  zipcode?: string;
+  hopperPriority?: number;
 }

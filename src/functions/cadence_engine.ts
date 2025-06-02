@@ -44,7 +44,7 @@ export const handler = async (
           action: 'queryDue',
           timestamp: currentTimestamp,
         });
-      
+
       // @ts-ignore
       if (dueContactsResult.statusCode === 200) {
         // @ts-ignore
@@ -76,11 +76,11 @@ export const handler = async (
       console.log(`Processing contact: ${contact.phoneNumber}, current status: ${contact.status}, attempts: ${contact.attemptCount}, disposition: ${contact.lastCallDisposition}`);
 
       // Determine rule: use NEW_LEAD if no attempts yet, otherwise use last disposition or DEFAULT
-      const ruleKey = contact.attemptCount === 0 && !contact.lastCallDisposition 
-                      ? 'NEW_LEAD' 
+      const ruleKey = contact.attemptCount === 0 && !contact.lastCallDisposition
+                      ? 'NEW_LEAD'
                       : contact.lastCallDisposition || 'DEFAULT';
       const dispositionRule = rules[ruleKey] || rules.DEFAULT;
-      
+
       console.log(`Applying rule: ${ruleKey} (max attempts: ${dispositionRule.maxAttempts})`);
 
       // Check Max Attempts FOR THE CURRENT DISPOSITION SEQUENCE.
