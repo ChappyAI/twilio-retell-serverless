@@ -8,6 +8,7 @@ import {
 } from "@twilio-labs/serverless-runtime-types/types";
 import VoiceResponse from "twilio/lib/twiml/VoiceResponse";
 import Retell from "retell-sdk";
+import { createCarrier } from "../utils/carrier_factory";
 
 type MyEvent = {
   AnsweredBy: string;
@@ -23,6 +24,8 @@ type MyEvent = {
 type MyContext = {
   RETELL_API_KEY: string;
   RETELL_AGENT_ID: string;
+  CARRIER: string;
+  TELNYX_API_KEY: string;
 };
 
 export const handler: ServerlessFunctionSignature<MyContext, MyEvent> =
@@ -56,13 +59,8 @@ export const handler: ServerlessFunctionSignature<MyContext, MyEvent> =
       });
 
       if (phoneCallResponse) {
-        // Start phone call websocket
-        const response = new VoiceResponse();
-        const dial = response.dial();
-        dial.sip(
-          `sip:${phoneCallResponse.call_id}@5t4n6j0wnrl.sip.livekit.cloud`
-        );
-
+        const carrier = createCarrier(context.CARRIER, context.getTwilioClient(), context);
+        const response = carrier.handleWebhook(phoneCallResponse);
         callback(null, response);
       } else {
         const response = new VoiceResponse();
